@@ -13,8 +13,14 @@ from coldstore.load.calc import BASELINE_KEY as LOAD_BASELINE_KEY
 from coldstore.load.calc import COEFFICIENT_KEY, DEFAULT_COEFFICIENT
 from coldstore.quota import Accumulator
 from coldstore.scheduler import Scheduler
+from coldstore.scheduler.planner import CAPACITY_KEY, RECOVERY_BASE_KEY
 from coldstore.scheduler.planner import THRESHOLD_KEY as SCHEDULE_THRESHOLD_KEY
 from coldstore.scheduler.planner import DEFAULT_THRESHOLD as SCHEDULE_THRESHOLD
+from coldstore.scheduler.windows import (
+    DEFAULT_MAX_CONCURRENT,
+    DEFAULT_RECOVERY_BASE_SECONDS,
+    DEFAULT_RECOVERY_PER_DEGREE_SECONDS,
+)
 from coldstore.store import Store, append_event, has_key
 from coldstore.temp import Collector
 from coldstore.temp.collector import WINDOW_KEY
@@ -51,5 +57,9 @@ def seed_defaults(store: Store) -> None:
     scheduler = Scheduler(store)
     if not has_key(store, SCHEDULE_THRESHOLD_KEY):
         scheduler.set_threshold(SCHEDULE_THRESHOLD)
+    if not has_key(store, CAPACITY_KEY):
+        scheduler.set_max_concurrent(DEFAULT_MAX_CONCURRENT)
+    if not has_key(store, RECOVERY_BASE_KEY):
+        scheduler.set_recovery(DEFAULT_RECOVERY_BASE_SECONDS, DEFAULT_RECOVERY_PER_DEGREE_SECONDS)
 
     append_event(store, EVENT_KEY, "seed", "defaults")

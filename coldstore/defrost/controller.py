@@ -2,10 +2,15 @@
 
 Every defrost follows the same sequence: the cold air fan stops first, then
 the warm up is recorded against the room. The command queue is persisted so an
-interrupted console can replay or discard pending work.
+interrupted console can replay or discard pending work. When an auditor and a
+schedule tracker are wired in, actual executions are recorded so the schedule
+can be checked against what really ran.
 """
 
 from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING
 
 from coldstore.fan import FanSet
 from coldstore.room import RoomRegistry
@@ -15,6 +20,10 @@ from coldstore.store.store import Store
 from .report import DefrostState
 from .schedule import now_unix
 
+if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
+    from coldstore.audit import Auditor
+    from coldstore.scheduler import Scheduler
+
 COMMAND_KEY = "defrost:commands"
 WARMUP_KEY_PREFIX = "defrost:warmup:"
 SPILL_KEY = "defrost:spill"
@@ -23,10 +32,19 @@ SPILL_KEY = "defrost:spill"
 class Controller:
     """Sequences defrost steps against the cold fans and rooms."""
 
-    def __init__(self, fans: FanSet, rooms: RoomRegistry, store: Store) -> None:
+    def __init__(
+        self,
+        fans: FanSet,
+        rooms: RoomRegistry,
+        store: Store,
+        auditor: "Auditor | None" = None,
+        tracker: "Scheduler | None" = None,
+    ) -> None:
         self._fans = fans
         self._rooms = rooms
         self._store = store
+        self._auditor = auditor
+        self._tracker = tracker
 
     def start(self, room_id: str) -> None:
         """Stop the fan first and only then begin the warm up."""
@@ -34,6 +52,13 @@ class Controller:
         self._fans.stop_all()
         self._warm(room_id)
         self._rooms.set_defrosting(room_id, True)
+        at = now_unix()
+        if self._tracker is not None:
+            self._tracker.note_start(room_id, at)
+        if self._auditor is not None:
+            self._auditor.record(
+                "defrost-start", json.dumps({"room": room_id, "at": at}, ensure_ascii=False)
+            )
 
     def _warm(self, room_id: str) -> None:
         if self._fans.running_ids():
@@ -47,6 +72,23 @@ class Controller:
         primary = self._fans.primary()
         if primary:
             self._fans.start(primary)
+        at = now_unix()
+        temp, _ = self._rooms.temp(room_id)
+        record = self._tracker.note_finish(room_id, at, temp) if self._tracker else None
+        if record is not None and self._auditor is not None:
+            self._auditor.record(
+                "defrost-finish",
+                json.dumps(
+                    {
+                        "room": room_id,
+                        "at": at,
+                        "plan": record.plan_id,
+                        "recovery_until": record.recovery_until,
+                        "recovery_respected": record.recovery_respected,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
 
     def enqueue(self, room_id: str) -> None:
         append_command(self._store, COMMAND_KEY, room_id)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 from coldstore.ammonia import validate_ppm, validate_threshold
@@ -11,9 +12,20 @@ from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.reporting import (
+    audit_export,
+    defrost_export,
+    schedule_export,
+    telemetry_export,
+    to_csv,
+)
 from coldstore.room import validate_zone
-from coldstore.scheduler import validate_threshold as validate_schedule_threshold
+from coldstore.scheduler import (
+    validate_capacity,
+    validate_horizon,
+    validate_recovery,
+    validate_threshold as validate_schedule_threshold,
+)
 from coldstore.store import export_state
 from coldstore.temp import validate_temp
 from coldstore.valve import OPEN, validate_valve
@@ -665,6 +677,64 @@ def schedule_plan(server: "Server", request: Request) -> Response:
     )
 
 
+def schedule_windows(server: "Server", request: Request) -> Response:
+    plan = server.runtime.scheduler.latest_plan()
+    return json_response({"plan": plan.as_dict() if plan else None})
+
+
+def schedule_replan(server: "Server", request: Request) -> Response:
+    reason = request.str_field("reason", "manual") or "manual"
+    now = request.int_field("now", 0) or None
+    horizon = request.int_field("horizon", 0) or None
+    if horizon is not None:
+        validate_horizon(horizon)
+    plan = server.runtime.scheduler.replan(
+        server.runtime.rooms, reason=reason, now=now, horizon=horizon
+    )
+    server.runtime.auditor.record(
+        "schedule",
+        json.dumps(
+            {
+                "plan": plan.plan_id,
+                "reason": plan.reason,
+                "windows": len(plan.windows),
+                "committed": len(plan.committed),
+                "deferred": len(plan.deferred),
+                "consistent": plan.consistent(),
+            },
+            ensure_ascii=False,
+        ),
+    )
+    return json_response({"plan": plan.as_dict(), "consistent": plan.consistent()})
+
+
+def schedule_capacity(server: "Server", request: Request) -> Response:
+    value = request.int_field("capacity")
+    validate_capacity(value)
+    return json_response({"max_concurrent": server.runtime.scheduler.set_max_concurrent(value)})
+
+
+def schedule_recovery(server: "Server", request: Request) -> Response:
+    base = request.int_field("base")
+    per_degree = request.int_field("per_degree")
+    validate_recovery(base, per_degree)
+    scheduler = server.runtime.scheduler
+    scheduler.set_recovery(base, per_degree)
+    return json_response({"recovery_base": base, "recovery_per_degree": per_degree})
+
+
+def schedule_history(server: "Server", request: Request) -> Response:
+    plans = server.runtime.scheduler.plans()
+    return json_response({"plans": [plan.as_dict() for plan in plans], "count": len(plans)})
+
+
+def schedule_executions(server: "Server", request: Request) -> Response:
+    records = server.runtime.scheduler.executions()
+    return json_response(
+        {"executions": [record.as_dict() for record in records], "count": len(records)}
+    )
+
+
 def export_audit(server: "Server", request: Request) -> Response:
     columns, rows = audit_export(server.runtime.auditor)
     return csv_response(to_csv(columns, rows))
@@ -672,6 +742,16 @@ def export_audit(server: "Server", request: Request) -> Response:
 
 def export_telemetry(server: "Server", request: Request) -> Response:
     columns, rows = telemetry_export(telemetry_module.collect(server.runtime))
+    return csv_response(to_csv(columns, rows))
+
+
+def export_schedule(server: "Server", request: Request) -> Response:
+    columns, rows = schedule_export(server.runtime.scheduler)
+    return csv_response(to_csv(columns, rows))
+
+
+def export_defrost(server: "Server", request: Request) -> Response:
+    columns, rows = defrost_export(server.runtime.scheduler)
     return csv_response(to_csv(columns, rows))
 
 

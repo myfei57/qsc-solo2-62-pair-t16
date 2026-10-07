@@ -35,8 +35,8 @@ class Runtime:
         self.cold_fans = cold_fans
         self.evap_fans = evap_fans
         self.evap = Condenser(store, evap_fans)
-        self.defrost = Controller(cold_fans, rooms, store)
-        self.load = LoadCalculator(store)
-        self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
         self.scheduler = Scheduler(store)
+        self.defrost = Controller(cold_fans, rooms, store, auditor=self.auditor, tracker=self.scheduler)
+        self.load = LoadCalculator(store)
+        self.accumulator = Accumulator(store)
