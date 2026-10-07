@@ -372,6 +372,115 @@ class ConsoleCase(unittest.TestCase):
         _, body = self.call("GET", "/schedule")
         self.assertEqual(body["due"], ["r2", "r1"])
 
+    def test_timeline_schedule_routes(self) -> None:
+        self.add_room("r1", 1, -20.0)
+        self.add_room("r2", 2, -8.0)
+        self.add_room("r3", 3, -5.0)
+
+        status, body = self.call("GET", "/schedule/timeline")
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["plan"])
+        self.assertEqual(body["config"]["concurrency"], 2)
+        self.assertEqual(body["latest_revision"], 0)
+
+        status, body = self.call(
+            "POST",
+            "/schedule/capacity",
+            {"concurrency": 1},
+        )
+        self.assertEqual(body["concurrency"], 1)
+        status, body = self.call(
+            "POST",
+            "/schedule/recovery",
+            {"recovery_seconds": 120},
+        )
+        self.assertEqual(body["recovery_seconds"], 120)
+
+        status, body = self.call(
+            "POST",
+            "/schedule/generate",
+            {"trigger": "initial", "now": 10_000},
+        )
+        self.assertEqual(status, 200)
+        plan = body["plan"]
+        self.assertTrue(plan["consistent"])
+        self.assertEqual(plan["policy_reschedule"], "rolling")
+        self.assertEqual(plan["policy_adjacency"], "serial")
+        self.assertEqual(plan["revision"], 1)
+        self.assertEqual(sorted(slot["room_id"] for slot in plan["slots"]), ["r2", "r3"])
+
+        # Revision history is retained and replayable.
+        status, body = self.call("GET", "/schedule/history", {"brief": "true"})
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["revisions"][0]["trigger"], "initial")
+        status, body = self.call("POST", "/schedule/revision", {"revision": 1})
+        self.assertEqual(body["plan"]["revision"], 1)
+        status, body = self.call("POST", "/schedule/revision", {"revision": 99})
+        self.assertEqual(status, 400)
+
+        # One lane: the second planned room cannot be dispatched concurrently.
+        first_room = plan["slots"][0]["room_id"]
+        second_room = next(
+            slot["room_id"] for slot in plan["slots"] if slot["room_id"] != first_room
+        )
+        status, body = self.call("POST", "/schedule/start", {"id": first_room, "at": 10_000})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["running"], [first_room])
+        status, body = self.call("POST", "/schedule/start", {"id": second_room, "at": 10_000})
+        self.assertEqual(status, 400)
+        self.assertIn("capacity", body["error"])
+
+        # A rolling regeneration freezes the in flight slot and carries it over.
+        status, body = self.call(
+            "POST",
+            "/schedule/generate",
+            {"trigger": "rolling-complete", "now": 10_010, "freeze_seconds": 0},
+        )
+        self.assertEqual(status, 200)
+        carried = [slot for slot in body["plan"]["slots"] if slot["frozen"]]
+        self.assertEqual(len(carried), 1)
+        self.assertEqual(carried[0]["room_id"], first_room)
+
+        # Finishing writes the actual execution record and releases capacity.
+        status, body = self.call(
+            "POST", "/schedule/complete", {"id": first_room, "at": 10_200}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["record"]["status"], "finished")
+        status, body = self.call("GET", "/schedule/executions")
+        self.assertEqual(len(body["records"]), 1)
+
+        # The audit trail captures the plan, the start and the finish.
+        status, summary = self.call("GET", "/audit/summary")
+        self.assertIn("schedule-plan", summary["by_kind"])
+        self.assertIn("schedule-exec-start", summary["by_kind"])
+        self.assertIn("schedule-exec-finish", summary["by_kind"])
+
+    def test_timeline_export_is_replayable(self) -> None:
+        self.add_room("r1", 1, -5.0)
+        self.call("POST", "/schedule/generate", {"trigger": "initial", "now": 500})
+        status, body = self.call("POST", "/export/schedule")
+        self.assertEqual(status, 200)
+        self.assertIn("policy_reschedule,rolling", body)
+        self.assertIn("policy_adjacency,serial", body)
+        self.assertIn("revision,room_id,ready_at", body)
+        self.assertIn("r1", body)
+        status, body = self.call("POST", "/export/schedule", {"revision": 1})
+        self.assertIn("revision,room_id,ready_at", body)
+        status, body = self.call("POST", "/export/schedule", {"revision": 42})
+        self.assertEqual(status, 400)
+
+    def test_timeline_validation_errors(self) -> None:
+        status, body = self.call("POST", "/schedule/capacity", {"concurrency": 0})
+        self.assertEqual(status, 400)
+        self.assertIn("at least one", body["error"])
+        status, body = self.call("POST", "/schedule/recovery", {"recovery_seconds": -3})
+        self.assertEqual(status, 400)
+        self.assertIn("positive", body["error"])
+        status, body = self.call("POST", "/schedule/start", {"id": "ghost"})
+        self.assertEqual(status, 400)
+        self.assertIn("no schedule revision", body["error"])
+
     def test_cycle_simulation_and_exports(self) -> None:
         self.add_room("r1", 1, -5.0)
         self.call("POST", "/comp/add", {"id": "c1", "stages": 4})

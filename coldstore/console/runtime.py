@@ -39,4 +39,4 @@ class Runtime:
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
-        self.scheduler = Scheduler(store)
+        self.scheduler = Scheduler(store, self.auditor)

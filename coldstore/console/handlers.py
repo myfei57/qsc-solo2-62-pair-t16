@@ -11,8 +11,18 @@ from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.reporting import audit_export, schedule_export, schedule_plan_meta, telemetry_export, to_csv
 from coldstore.room import validate_zone
+from coldstore.scheduler import (
+    TRIGGER_MANUAL,
+    TimelinePlan,
+    validate_concurrency,
+    validate_freeze_seconds,
+    validate_horizon_seconds,
+    validate_recovery_seconds,
+    validate_response_seconds,
+    validate_tolerance_seconds,
+)
 from coldstore.scheduler import validate_threshold as validate_schedule_threshold
 from coldstore.store import export_state
 from coldstore.temp import validate_temp
@@ -663,6 +673,189 @@ def schedule_plan(server: "Server", request: Request) -> Response:
     return json_response(
         {"entries": [entry.as_dict() for entry in scheduler.plan(rooms)], "due": scheduler.due(rooms)}
     )
+
+
+def _int_map(request: Request, name: str) -> dict[str, int] | None:
+    value = request.payload.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be an object keyed by room id")
+    mapping: dict[str, int] = {}
+    for room_id, seconds in value.items():
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float, str)):
+            raise ValueError(f"{name}.{room_id} must be an integer number of seconds")
+        try:
+            parsed = int(seconds)
+        except ValueError as exc:
+            raise ValueError(f"{name}.{room_id} must be an integer number of seconds") from exc
+        mapping[str(room_id)] = parsed
+    return mapping
+
+
+def _require_plan(server: "Server") -> TimelinePlan:
+    plan = server.runtime.scheduler.latest_plan()
+    if plan is None:
+        raise ValueError("no schedule revision has been generated yet")
+    return plan
+
+
+def schedule_timeline(server: "Server", request: Request) -> Response:
+    """Latest rolling revision with config, executions and reschedule policy."""
+
+    scheduler = server.runtime.scheduler
+    plan = scheduler.latest_plan()
+    payload: dict[str, object] = {
+        "config": scheduler.timeline.config(),
+        "executions": [record.as_dict() for record in scheduler.execution_records()],
+        "running": scheduler.executions.running_ids(),
+        "latest_revision": scheduler.timeline.revision(),
+        "plan": plan.as_dict() if plan else None,
+    }
+    return json_response(payload)
+
+
+def schedule_generate(server: "Server", request: Request) -> Response:
+    """Generate the next rolling revision (queued by recovery time)."""
+
+    scheduler = server.runtime.scheduler
+    rooms = server.runtime.rooms
+    trigger = request.str_field("trigger", TRIGGER_MANUAL)
+    if not trigger:
+        trigger = TRIGGER_MANUAL
+    concurrency_raw = request.payload.get("concurrency")
+    freeze_raw = request.payload.get("freeze_seconds")
+    now_raw = request.payload.get("now")
+    if concurrency_raw is not None:
+        validate_concurrency(int(concurrency_raw))
+    if freeze_raw is not None:
+        validate_freeze_seconds(int(freeze_raw))
+    if now_raw is not None and not isinstance(now_raw, (int, float)):
+        raise ValueError("now must be a unix timestamp")
+    plan = scheduler.generate(
+        rooms,
+        trigger=trigger,
+        reason=request.str_field("reason"),
+        now=None if now_raw is None else int(now_raw),
+        durations=_int_map(request, "defrost_seconds"),
+        recoveries=_int_map(request, "recovery_seconds"),
+        ready_at=_int_map(request, "ready_at"),
+        due_at=_int_map(request, "due_at"),
+        concurrency=None if concurrency_raw is None else int(concurrency_raw),
+        freeze_seconds=None if freeze_raw is None else int(freeze_raw),
+    )
+    return json_response({"plan": plan.as_dict(), "consistent": plan.consistent})
+
+
+def schedule_history(server: "Server", request: Request) -> Response:
+    plans = server.runtime.scheduler.plan_history()
+    brief = request.str_field("brief") not in ("", "false", "0")
+    if brief:
+        payload = [
+            {
+                "revision": plan.revision,
+                "generated_at": plan.generated_at,
+                "trigger": plan.trigger,
+                "reason": plan.reason,
+                "slots": len(plan.slots),
+                "consistent": plan.consistent,
+                "late": sum(1 for slot in plan.slots if slot.late),
+            }
+            for plan in plans
+        ]
+    else:
+        payload = [plan.as_dict() for plan in plans]
+    return json_response({"revisions": payload, "count": len(payload)})
+
+
+def schedule_revision(server: "Server", request: Request) -> Response:
+    """Reopen one specific revision for inspection or export."""
+
+    number = request.int_field("revision", -1)
+    plan = server.runtime.scheduler.revision_plan(number)
+    if plan is None:
+        raise ValueError(f"schedule revision {number} not found")
+    return json_response({"plan": plan.as_dict()})
+
+
+def schedule_capacity(server: "Server", request: Request) -> Response:
+    value = request.int_field("concurrency")
+    validate_concurrency(value)
+    return json_response({"concurrency": server.runtime.scheduler.set_concurrency(value)})
+
+
+def schedule_recovery(server: "Server", request: Request) -> Response:
+    value = request.int_field("recovery_seconds")
+    validate_recovery_seconds(value)
+    return json_response({"recovery_seconds": server.runtime.scheduler.set_recovery_seconds(value)})
+
+
+def schedule_response_window(server: "Server", request: Request) -> Response:
+    value = request.int_field("response_seconds")
+    validate_response_seconds(value)
+    return json_response({"response_seconds": server.runtime.scheduler.set_response_seconds(value)})
+
+
+def schedule_freeze(server: "Server", request: Request) -> Response:
+    value = request.int_field("freeze_seconds")
+    validate_freeze_seconds(value)
+    return json_response({"freeze_seconds": server.runtime.scheduler.set_freeze_seconds(value)})
+
+
+def schedule_tolerance(server: "Server", request: Request) -> Response:
+    value = request.int_field("tolerance_seconds")
+    validate_tolerance_seconds(value)
+    return json_response({"tolerance_seconds": server.runtime.scheduler.set_tolerance_seconds(value)})
+
+
+def schedule_horizon(server: "Server", request: Request) -> Response:
+    value = request.int_field("horizon_seconds")
+    validate_horizon_seconds(value)
+    return json_response({"horizon_seconds": server.runtime.scheduler.set_horizon_seconds(value)})
+
+
+def schedule_start(server: "Server", request: Request) -> Response:
+    """Dispatch one planned defrost; capacity/window breaches are rejected."""
+
+    room_id = request.str_field("id")
+    at_raw = request.payload.get("at")
+    at = None if at_raw is None else int(at_raw)
+    record = server.runtime.scheduler.executions.start(room_id, at=at)
+    return json_response(
+        {"started": room_id, "record": record.as_dict(), "running": server.runtime.scheduler.executions.running_ids()}
+    )
+
+
+def schedule_complete(server: "Server", request: Request) -> Response:
+    """Record the actual finish so it lands in audit and can release capacity."""
+
+    room_id = request.str_field("id")
+    at_raw = request.payload.get("at")
+    at = None if at_raw is None else int(at_raw)
+    record = server.runtime.scheduler.executions.finish(room_id, at=at)
+    return json_response({"finished": room_id, "record": record.as_dict()})
+
+
+def schedule_executions(server: "Server", request: Request) -> Response:
+    records = server.runtime.scheduler.execution_records()
+    return json_response(
+        {"records": [record.as_dict() for record in records], "running": [r.room_id for r in records if r.status == "running"]}
+    )
+
+
+def export_schedule(server: "Server", request: Request) -> Response:
+    """Export one revision as a self describing CSV; defaults to latest."""
+
+    number_raw = request.payload.get("revision")
+    if number_raw is None:
+        plan = _require_plan(server)
+    else:
+        plan = server.runtime.scheduler.revision_plan(int(number_raw))
+        if plan is None:
+            raise ValueError(f"schedule revision {number_raw} not found")
+    columns, rows = schedule_export(plan)
+    body = to_csv(["key", "value"], schedule_plan_meta(plan)) + to_csv(columns, rows)
+    return csv_response(body)
 
 
 def export_audit(server: "Server", request: Request) -> Response:

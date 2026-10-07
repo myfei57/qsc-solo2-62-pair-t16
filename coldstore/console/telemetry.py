@@ -37,6 +37,10 @@ class Telemetry:
     quota_value: float
     audit_entries: int
     schedule_due: int
+    schedule_revision: int
+    schedule_consistent: bool
+    schedule_capacity: int
+    schedule_running: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -66,6 +70,10 @@ class Telemetry:
             "quota_value": self.quota_value,
             "audit_entries": self.audit_entries,
             "schedule_due": self.schedule_due,
+            "schedule_revision": self.schedule_revision,
+            "schedule_consistent": self.schedule_consistent,
+            "schedule_capacity": self.schedule_capacity,
+            "schedule_running": self.schedule_running,
         }
 
 
@@ -74,6 +82,7 @@ def collect(rt: Runtime) -> Telemetry:
 
     temp = rt.temp.state()
     compressor_state = rt.compressors.state()
+    plan = rt.scheduler.latest_plan()
     return Telemetry(
         store_keys=rt.store.count(),
         rooms=rt.rooms.count(),
@@ -101,4 +110,8 @@ def collect(rt: Runtime) -> Telemetry:
         quota_value=rt.accumulator.value(),
         audit_entries=rt.auditor.count(),
         schedule_due=len(rt.scheduler.due(rt.rooms)),
+        schedule_revision=plan.revision if plan else 0,
+        schedule_consistent=plan.consistent if plan else True,
+        schedule_capacity=rt.scheduler.concurrency(),
+        schedule_running=len(rt.scheduler.executions.running_ids()),
     )
